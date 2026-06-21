@@ -1,0 +1,12 @@
+# Egress allow-list for the secure-exec installer proxy (tinyproxy Filter file).
+#
+# With `FilterDefaultDeny Yes`, ONLY hosts matching a line here may be reached;
+# everything else is refused. Patterns are extended regular expressions matched
+# against the destination host (FilterExtended On). Anchored to avoid a
+# substring like "pypi.org.evil.com" slipping through.
+#
+# pip talks to exactly two hosts:
+#   - pypi.org                -> the package index / Simple API
+#   - files.pythonhosted.org  -> the actual wheel/sdist downloads (Fastly CDN)
+^pypi\.org$
+^files\.pythonhosted\.org$

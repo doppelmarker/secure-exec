@@ -1,6 +1,25 @@
-IMAGE ?= secure-exec:latest
-AUDIT_IMAGE ?= secure-exec:audit
+# --- Images (two-phase model: runner executes code, installer builds venvs) ---
+RUNNER_IMAGE    ?= secure-exec-runner:latest
+INSTALLER_IMAGE ?= secure-exec-installer:latest
+PROXY_IMAGE     ?= secure-exec-proxy:latest
+AUDIT_IMAGE     ?= secure-exec:audit
+# Back-compat alias: the runner is the original sandbox image.
+IMAGE           ?= $(RUNNER_IMAGE)
+
 APPARMOR_PROFILE ?= secure-exec-userns
+
+# wheel (default, no compiler) | source (adds gcc/headers for sdists).
+SE_INSTALL_MODE ?= wheel
+
+# --- Per-user venv orchestration knobs ---
+USER ?=                                 # per-user id, e.g. USER=alice
+PKGS ?=                                 # space-separated packages, e.g. PKGS="numpy pandas"
+VENV_VOLUME      ?= se-venv-$(USER)     # per-user Docker volume name
+VENV_SIZE_BYTES  ?= 1073741824          # 1 GiB cap for a user venv
+PROXY_NET        ?= se-proxy-net        # --internal net: installer <-> proxy ONLY
+EGRESS_NET       ?= se-egress-net       # proxy's route to the internet
+PROXY_NAME       ?= se-proxy            # running proxy container name
+PROXY_URL        ?= http://$(PROXY_NAME):8888
 
 # Use BuildKit (buildx) rather than the deprecated legacy builder.
 export DOCKER_BUILDKIT = 1
@@ -33,13 +52,30 @@ DOCKER_RUN_FLAGS = --rm -i --network none \
 	--security-opt apparmor=$(APPARMOR_PROFILE) \
 	--security-opt systempaths=unconfined
 
-.PHONY: build build-audit apparmor run example test audit audit-outer audit-inner clean
+.PHONY: build build-runner build-installer build-proxy build-audit \
+        apparmor run example test \
+        proxy-up proxy-down venv-create venv-remove install-venv exec-venv \
+        audit audit-outer audit-inner clean
 
-build:
-	docker build -t $(IMAGE) .
+# Build all images for the two-phase model.
+build: build-runner build-installer build-proxy
 
-# Audit image = production runtime + amicontained. Kept separate so the prod
-# image stays minimal (no introspection binary inside the jail).
+# Runner: executes untrusted code (no network, RO rootfs, single mounted venv).
+build-runner:
+	docker build --target runner -t $(RUNNER_IMAGE) .
+
+# Installer: runs pip UNDER nsjail into a user venv, egress only to the proxy.
+# SE_INSTALL_MODE selects the target: wheel (no compiler) or source (gcc/headers).
+build-installer:
+	docker build --target installer-$(SE_INSTALL_MODE) -t $(INSTALLER_IMAGE) .
+
+# Egress proxy: the only host that reaches PyPI (allow-lists pypi.org +
+# files.pythonhosted.org).
+build-proxy:
+	docker build --target tinyproxy -t $(PROXY_IMAGE) .
+
+# Audit image = runner + amicontained. Kept separate so the prod image stays
+# minimal (no introspection binary inside the jail).
 build-audit:
 	docker build --target audit -t $(AUDIT_IMAGE) .
 
@@ -51,18 +87,90 @@ apparmor:
 		 apparmor_parser -r -W /etc/apparmor.d/$(APPARMOR_PROFILE) && \
 		 echo "loaded $(APPARMOR_PROFILE)"'
 
-# Run an ad-hoc script from stdin, e.g.: echo 'print(1+1)' | make run
+# Run an ad-hoc script from stdin against the default venv, e.g.:
+#   echo 'print(1+1)' | make run
+# To run against a user venv, use `make exec-venv USER=... ` instead.
 run:
-	docker run $(DOCKER_RUN_FLAGS) $(IMAGE) -
+	docker run $(DOCKER_RUN_FLAGS) $(RUNNER_IMAGE) -
 
 example:
-	docker run $(DOCKER_RUN_FLAGS) $(IMAGE) - < examples/numpy_pandas.py
+	docker run $(DOCKER_RUN_FLAGS) $(RUNNER_IMAGE) - < examples/numpy_pandas.py
 
 # Tests run via uv (dev group provides pytest). uv syncs deps automatically.
-# Assumes `make apparmor` has loaded the profile on this host.
+# Assumes `make apparmor` has loaded the profile on this host. Builds all images
+# the suite needs (runner + installer + proxy).
 test: build
-	SECURE_EXEC_IMAGE=$(IMAGE) SECURE_EXEC_APPARMOR=$(APPARMOR_PROFILE) \
+	SECURE_EXEC_RUNNER_IMAGE=$(RUNNER_IMAGE) \
+	SECURE_EXEC_INSTALLER_IMAGE=$(INSTALLER_IMAGE) \
+	SECURE_EXEC_PROXY_IMAGE=$(PROXY_IMAGE) \
+	SECURE_EXEC_IMAGE=$(RUNNER_IMAGE) \
+	SECURE_EXEC_APPARMOR=$(APPARMOR_PROFILE) \
 		uv run pytest tests/ -v
+
+# --- Per-user venv orchestration -----------------------------------------------
+# The install topology: an --internal network (PROXY_NET) joins ONLY the installer
+# and the proxy, so the installer has NO route to the internet except the proxy.
+# The proxy alone joins EGRESS_NET to reach PyPI. This enforces "proxy is the only
+# egress" at the network layer (no CAP_NET_ADMIN needed) and maps to a K8s
+# NetworkPolicy later. See CLAUDE.md "Two-phase model".
+
+# Start the egress proxy on both networks. Idempotent-ish (ignores "exists").
+proxy-up:
+	-docker network create --internal $(PROXY_NET)
+	-docker network create $(EGRESS_NET)
+	-docker rm -f $(PROXY_NAME) 2>/dev/null
+	docker run -d --name $(PROXY_NAME) --network $(PROXY_NET) \
+		--cap-drop ALL --security-opt no-new-privileges --read-only \
+		--tmpfs /run:rw,nosuid,nodev,size=8m \
+		$(PROXY_IMAGE)
+	docker network connect $(EGRESS_NET) $(PROXY_NAME)
+
+proxy-down:
+	-docker rm -f $(PROXY_NAME)
+
+# Create a per-user venv volume with a ~1GiB cap. NOTE: a hard ON-DISK quota is
+# not enforceable with the stock local driver; this size-capped tmpfs volume is a
+# RAM-backed approximation (in K8s the PVC size is the real quota). Override with
+# VENV_VOLUME / VENV_SIZE_BYTES.
+venv-create:
+	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }
+	docker volume create --driver local \
+		--opt type=tmpfs --opt device=tmpfs \
+		--opt o=size=$(VENV_SIZE_BYTES) \
+		$(VENV_VOLUME)
+
+venv-remove:
+	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }
+	-docker volume rm $(VENV_VOLUME)
+
+# Install PKGS into USER's venv, under nsjail, egress only to the proxy.
+# Requires `make proxy-up` and `make venv-create USER=...` first.
+# Example: make install-venv USER=alice PKGS="requests rich"
+# The hardening flags mirror DOCKER_RUN_FLAGS but DROP `--network none` (the
+# installer must reach the proxy) and attach PROXY_NET instead.
+install-venv:
+	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }
+	@test -n "$(PKGS)" || { echo "PKGS= is required"; exit 1; }
+	docker run --rm -i --network $(PROXY_NET) \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--read-only \
+		--tmpfs /tmp:rw,nosuid,nodev,size=1152m \
+		--pids-limit 512 \
+		--memory 3g --memory-swap 3g --cpus 2 \
+		--security-opt seccomp=unconfined \
+		--security-opt apparmor=$(APPARMOR_PROFILE) \
+		--security-opt systempaths=unconfined \
+		-v $(VENV_VOLUME):/venv \
+		-e SE_INSTALL_MODE=$(SE_INSTALL_MODE) \
+		-e SE_PROXY_URL=$(PROXY_URL) \
+		$(INSTALLER_IMAGE) $(PKGS)
+
+# Run a script from stdin against USER's venv (no network, venv read-only).
+# Example: echo 'import rich; print(rich.__version__)' | make exec-venv USER=alice
+exec-venv:
+	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }
+	docker run $(DOCKER_RUN_FLAGS) -v $(VENV_VOLUME):/venv:ro $(RUNNER_IMAGE) -
 
 # --- Auditing with amicontained (needs `make build-audit`) ---------------------
 # audit-outer: introspect the CONTAINER itself (bypass nsjail via --entrypoint).
@@ -85,4 +193,6 @@ audit-inner: build-audit
 		| docker run $(DOCKER_RUN_FLAGS) -e SE_MEM_MB=4096 $(AUDIT_IMAGE) -
 
 clean:
-	-docker image rm $(IMAGE) $(AUDIT_IMAGE)
+	-docker image rm $(RUNNER_IMAGE) $(INSTALLER_IMAGE) $(PROXY_IMAGE) $(AUDIT_IMAGE)
+	-docker rm -f $(PROXY_NAME)
+	-docker network rm $(PROXY_NET) $(EGRESS_NET)

@@ -64,9 +64,12 @@ RUN git clone --depth 1 --branch "${AMICONTAINED_VERSION}" \
     && test -x /amicontained
 
 ############################
-# Stage 2: runtime (PRODUCTION target — minimal, no audit tools)
+# Stage 2: runtime-base (shared by runner + installer; NOT a runnable target)
 ############################
-FROM python:3.12-slim-bookworm AS runtime
+# Everything common to both phases: the nsjail binary, its runtime libs, the
+# shared app files, and the unprivileged sandbox user. The runner and installer
+# targets extend this with phase-specific pieces (default venv / pip+proxy).
+FROM python:3.12-slim-bookworm AS runtime-base
 
 # Runtime libs nsjail links against (protobuf + libnl). No build tools here.
 # hadolint ignore=DL3008
@@ -76,46 +79,116 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get purge -y --auto-remove
 
+COPY --from=build /src/nsjail /usr/local/bin/nsjail
+
+# The ONLY app file shared by both phases: the per-arch seccomp helper, sourced
+# by both run.sh and install.sh. Phase-specific files (entrypoint script, proto
+# template, driver .py) are copied in the respective targets so each image ships
+# only its own code path.
+COPY sandbox/seccomp-arch.sh /opt/secure-exec/sandbox/seccomp-arch.sh
+RUN chmod 0444 /opt/secure-exec/sandbox/seccomp-arch.sh
+
+# Unprivileged runtime user. nsjail builds the inner userns from here; it does
+# NOT need to be root in the container.
+RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin sandbox
+
+############################
+# Stage 2a: runner (PRODUCTION exec target — minimal, no pip/network/audit)
+############################
+# Build with: docker build --target runner -t secure-exec-runner:latest .
+# Runs untrusted user code with NO network, read-only rootfs, against a single
+# mounted venv. Carries NO pip-at-runtime, NO proxy, NO build tools, NO install.sh.
+FROM runtime-base AS runner
+
 # Default venv (RUNNER ONLY). The runner imports third-party packages ONLY from
 # a venv mounted at /venv (PYTHONPATH=/venv/site), never from the image's own
 # site-packages. When no user volume is attached, run.sh binds this baked default
 # venv as /venv. Built with pip --target (NOT `python -m venv`) so it holds
 # packages only, no interpreter; made read-only so nothing can mutate it at
-# runtime. The installer image does NOT get this (it builds user venvs instead);
-# when the Dockerfile is split (runtime-base -> runner/installer), this step
-# moves into the runner target only.
+# runtime.
 RUN pip install --no-cache-dir --target=/opt/default-venv/site \
         numpy==2.2.1 \
         pandas==2.2.3 \
     && chmod -R a-w /opt/default-venv
 
-COPY --from=build /src/nsjail /usr/local/bin/nsjail
-
-# Application files live under /opt and are world-readable, never writable.
-COPY nsjail/python.proto.template /opt/secure-exec/nsjail/python.proto.template
-COPY sandbox/runner.py            /opt/secure-exec/sandbox/runner.py
 COPY sandbox/run.sh               /opt/secure-exec/sandbox/run.sh
+COPY sandbox/runner.py            /opt/secure-exec/sandbox/runner.py
+COPY nsjail/python.proto.template /opt/secure-exec/nsjail/python.proto.template
 RUN chmod 0755 /opt/secure-exec/sandbox/run.sh \
-    && chmod 0444 /opt/secure-exec/nsjail/python.proto.template \
-                  /opt/secure-exec/sandbox/runner.py
+    && chmod 0444 /opt/secure-exec/sandbox/runner.py \
+                  /opt/secure-exec/nsjail/python.proto.template
 
-# Unprivileged runtime user. nsjail builds the inner userns from here; it does
-# NOT need to be root in the container.
-RUN useradd --uid 10001 --create-home --shell /usr/sbin/nologin sandbox
 USER 10001
 WORKDIR /home/sandbox
-
 ENTRYPOINT ["/opt/secure-exec/sandbox/run.sh"]
 
 ############################
-# Stage 3: audit (DEV/AUDIT target — runtime + amicontained)
+# Stage 2b: installer-wheel (installs PyPI wheels into a user venv, under nsjail)
+############################
+# Build with: docker build --target installer-wheel -t secure-exec-installer:latest .
+# Runs `pip install` UNDER nsjail into a per-user /venv volume, reaching ONLY the
+# egress proxy. Wheel mode: --only-binary :all:, so NO build toolchain is needed
+# and no setup.py runs at install time. Carries NO run.sh / runner / default venv.
+FROM runtime-base AS installer-wheel
+
+COPY sandbox/install.sh            /opt/secure-exec/sandbox/install.sh
+COPY sandbox/installer.py          /opt/secure-exec/sandbox/installer.py
+COPY nsjail/install.proto.template /opt/secure-exec/nsjail/install.proto.template
+RUN chmod 0755 /opt/secure-exec/sandbox/install.sh \
+    && chmod 0444 /opt/secure-exec/sandbox/installer.py \
+                  /opt/secure-exec/nsjail/install.proto.template
+
+USER 10001
+WORKDIR /home/sandbox
+ENTRYPOINT ["/opt/secure-exec/sandbox/install.sh"]
+
+############################
+# Stage 2c: installer-source (installer-wheel + a build toolchain for sdists)
+############################
+# Build with: docker build --target installer-source -t secure-exec-installer:source .
+# Same as installer-wheel but adds gcc/headers so sdists can be compiled when the
+# caller opts into SE_INSTALL_MODE=source. Build code runs INSIDE the install
+# jail (caps dropped, seccomp, egress limited to the proxy). Larger attack
+# surface than wheel mode -> opt-in only.
+FROM installer-wheel AS installer-source
+USER 0
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc \
+        g++ \
+        libc6-dev \
+        python3-dev \
+    && rm -rf /var/lib/apt/lists/*
+USER 10001
+
+############################
+# Stage 2d: tinyproxy (egress proxy — the only host that reaches PyPI)
+############################
+# Build with: docker build --target tinyproxy -t secure-exec-proxy:latest .
+# Forward proxy that allow-lists pypi.org + files.pythonhosted.org. The installer
+# container reaches it over an --internal Docker network; this proxy alone joins
+# an egress network to reach PyPI.
+FROM debian:bookworm-slim AS tinyproxy
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        tinyproxy \
+    && rm -rf /var/lib/apt/lists/*
+COPY proxy/tinyproxy.conf /etc/tinyproxy/tinyproxy.conf
+COPY proxy/allowlist      /etc/tinyproxy/allowlist
+RUN chmod 0444 /etc/tinyproxy/tinyproxy.conf /etc/tinyproxy/allowlist
+USER nobody
+EXPOSE 8888
+# -d: run in the foreground (PID 1, logs to stdout).
+ENTRYPOINT ["tinyproxy", "-d", "-c", "/etc/tinyproxy/tinyproxy.conf"]
+
+############################
+# Stage 3: audit (DEV/AUDIT target — runner + amicontained)
 ############################
 # Build with: docker build --target audit -t secure-exec:audit .
-# This image is identical to the production runtime but adds the amicontained
-# binary under /usr/local/bin so it is reachable both directly (outer audit,
-# via --entrypoint) and inside the jail (inner audit, since the jail mounts
-# /usr read-only and /usr/local/bin lives under it). Keep it OUT of prod.
-FROM runtime AS audit
+# Identical to the runner but adds the amicontained binary under /usr/local/bin
+# so it is reachable both directly (outer audit, via --entrypoint) and inside the
+# jail (inner audit, since the jail mounts /usr read-only). Keep it OUT of prod.
+FROM runner AS audit
 USER 0
 COPY --from=amicontained-build /amicontained /usr/local/bin/amicontained
 RUN chmod 0555 /usr/local/bin/amicontained

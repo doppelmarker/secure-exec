@@ -1,0 +1,248 @@
+# nsjail configuration for the INSTALL phase (pip install into a user venv).
+#
+# This is the network-enabled sibling of python.proto.template (the runner).
+# It runs `pip install` UNDER nsjail so that arbitrary install/build code is
+# jailed: caps dropped, seccomp applied, pivot_root'ed, and reachable network
+# limited to the egress proxy. Differences from the runner policy:
+#   - network is ON (clone_newnet:false) so pip can reach the proxy; egress is
+#     constrained at the network layer (the container sits on an --internal
+#     Docker network whose only other member is the proxy), NOT by these settings
+#   - /venv is mounted READ-WRITE (pip --target=/venv/site writes here)
+#   - relaxed rlimits / time limit (downloads + builds need more room)
+#   - extra read-only mounts pip needs: DNS/hosts files and the TLS CA bundle
+#   - a larger /tmp tmpfs (pip unpacks wheels and builds sdists there)
+# The seccomp KILL list is IDENTICAL to the runner: pip and gcc need none of the
+# killed syscalls, and network syscalls (socket/connect/...) are already allowed
+# (DEFAULT ALLOW) -- network access comes entirely from clone_newnet:false, not
+# from relaxing seccomp.
+#
+# Placeholders substituted by sandbox/run.sh at runtime:
+#   {TIME_LIMIT}  {RLIMIT_AS_MB}  {JOB_DIR}  {SECCOMP_ARCH_EXTRA}
+
+name: "secure-python-install"
+description: "Network-enabled pip-install jail (egress to proxy only)"
+
+mode: ONCE
+hostname: "installer"
+cwd: "/sandbox"
+log_level: WARNING
+
+# ---- Resource limits (relaxed vs the runner; still bounded) ----
+time_limit: {TIME_LIMIT}        # wall-clock seconds (run.sh default 300)
+rlimit_as: {RLIMIT_AS_MB}       # address space (MB) (run.sh default 2048)
+rlimit_as_type: VALUE
+rlimit_cpu: {TIME_LIMIT}        # CPU seconds
+rlimit_cpu_type: VALUE
+rlimit_fsize: 1024              # wheels/sdists are large; allow up to 1GB writes
+rlimit_fsize_type: VALUE
+rlimit_nofile: 1024             # pip opens many files
+rlimit_nofile_type: VALUE
+rlimit_nproc: 256              # pip + build subprocesses
+rlimit_nproc_type: VALUE
+rlimit_core: 0                  # no core dumps
+rlimit_core_type: VALUE
+
+# ---- Namespaces ----
+# clone_newnet:false => INHERIT the container's net namespace so pip can reach
+# the proxy. The container itself has no route to the internet except the proxy
+# (it sits on an --internal Docker network), so even raw sockets can only reach
+# the proxy. All the OTHER namespaces are still fresh, as in the runner.
+clone_newnet: false
+clone_newuser: true
+clone_newns: true
+clone_newpid: true
+clone_newipc: true
+clone_newuts: true
+clone_newcgroup: true
+
+# Rootless mapping: namespaced uid 0 -> the container's unprivileged uid.
+uidmap { inside_id: "0" outside_id: "" count: 1 }
+gidmap { inside_id: "0" outside_id: "" count: 1 }
+
+# ---- Privilege hardening (identical to runner) ----
+keep_caps: false                # drop ALL capabilities
+disable_no_new_privs: false     # keep prctl(NO_NEW_PRIVS, 1)
+keep_env: false                 # start from an empty environment
+skip_setsid: false
+
+# ---- /proc: read-only ----
+mount_proc: false
+mount {
+    dst: "/proc"
+    fstype: "proc"
+    rw: false
+}
+
+# ---- Root filesystem: read-only binds (CPython, pip, libs) ----
+mount {
+    src: "/usr"
+    dst: "/usr"
+    is_bind: true
+    rw: false
+}
+mount {
+    src: "/bin"
+    dst: "/bin"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/lib"
+    dst: "/lib"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/lib64"
+    dst: "/lib64"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/lib/aarch64-linux-gnu"
+    dst: "/lib/aarch64-linux-gnu"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/usr/lib/aarch64-linux-gnu"
+    dst: "/usr/lib/aarch64-linux-gnu"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/etc/ld.so.cache"
+    dst: "/etc/ld.so.cache"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+
+# ---- Networking support files (UNLIKE the runner, which forbids these) ----
+# pip must resolve the proxy hostname and validate TLS. These are required only
+# because this phase has network; the runner deliberately omits them.
+mount {
+    src: "/etc/resolv.conf"
+    dst: "/etc/resolv.conf"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/etc/hosts"
+    dst: "/etc/hosts"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/etc/nsswitch.conf"
+    dst: "/etc/nsswitch.conf"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+# TLS trust store (certifi may also be used by pip, but bind the system store so
+# the proxy/PyPI certs validate regardless).
+mount {
+    src: "/etc/ssl/certs"
+    dst: "/etc/ssl/certs"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+
+# ---- The installer driver: installer.py, read-only ----
+mount {
+    src: "{JOB_DIR}"
+    dst: "/sandbox"
+    is_bind: true
+    rw: false
+}
+
+# ---- The user venv, READ-WRITE (pip --target=/venv/site writes here) ----
+mount {
+    src: "/venv"
+    dst: "/venv"
+    is_bind: true
+    rw: true
+}
+
+# ---- Writable scratch: larger than the runner (pip unpacks/builds here) ----
+mount {
+    dst: "/tmp"
+    fstype: "tmpfs"
+    rw: true
+    is_bind: false
+    options: "size=1024M"
+}
+mount {
+    dst: "/dev/shm"
+    fstype: "tmpfs"
+    rw: true
+    is_bind: false
+    options: "size=64M"
+}
+
+# ---- Minimal /dev ----
+mount {
+    src: "/dev/null"
+    dst: "/dev/null"
+    is_bind: true
+    rw: true
+}
+mount {
+    src: "/dev/zero"
+    dst: "/dev/zero"
+    is_bind: true
+    rw: true
+}
+mount {
+    src: "/dev/urandom"
+    dst: "/dev/urandom"
+    is_bind: true
+    rw: false
+}
+mount {
+    src: "/dev/random"
+    dst: "/dev/random"
+    is_bind: true
+    rw: false
+}
+
+# ---- Environment ----
+envar: "HOME=/tmp"
+envar: "TMPDIR=/tmp"
+envar: "PATH=/usr/local/bin:/usr/bin:/bin"
+envar: "LANG=C.UTF-8"
+envar: "PYTHONDONTWRITEBYTECODE=1"
+envar: "PYTHONUNBUFFERED=1"
+# Proxy config (FUNCTIONAL only -- security is the network topology, not these).
+# run.sh passes SE_PROXY_URL through; installer.py also reads it.
+envar: "HTTP_PROXY={PROXY_URL}"
+envar: "HTTPS_PROXY={PROXY_URL}"
+envar: "PIP_INDEX_URL=https://pypi.org/simple"
+envar: "PIP_DISABLE_PIP_VERSION_CHECK=1"
+envar: "PIP_NO_INPUT=1"
+
+# ---- seccomp-bpf policy (IDENTICAL to the runner; see header note) ----
+seccomp_string: "POLICY a { "
+seccomp_string: "  KILL {"
+seccomp_string: "    ptrace, process_vm_readv, process_vm_writev,"
+seccomp_string: "    mount, pivot_root, chroot, "
+seccomp_string: "    setns, unshare,"
+seccomp_string: "    init_module, finit_module, delete_module,"
+seccomp_string: "    kexec_load,"
+seccomp_string: "    bpf, perf_event_open,"
+seccomp_string: "    reboot, swapon, swapoff,"
+seccomp_string: "    add_key, request_key, keyctl,"
+seccomp_string: "    acct, quotactl, nfsservctl"
+seccomp_string: "{SECCOMP_ARCH_EXTRA}"
+seccomp_string: "  } "
+seccomp_string: "} "
+seccomp_string: "USE a DEFAULT ALLOW"
