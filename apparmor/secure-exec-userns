@@ -1,0 +1,40 @@
+# AppArmor profile for the secure-exec sandbox container.
+#
+# Purpose: on hosts where kernel.apparmor_restrict_unprivileged_userns=1
+# (Ubuntu 23.10+ / 6.8 kernels, including Colima's VM), unprivileged +
+# *unconfined* processes are denied user-namespace creation. nsjail needs to
+# create a user namespace to build its rootless sandbox. Rather than disabling
+# that kernel hardening globally, we attach THIS profile to only the sandbox
+# container and grant it the single extra permission it needs: `userns,`.
+#
+# The container otherwise stays unprivileged and non-root; nsjail still drops
+# all capabilities and applies its own seccomp for the untrusted payload.
+#
+# Load into the host kernel (in Colima: `colima ssh -- sudo apparmor_parser -r -W <file>`)
+# then run: docker run --security-opt apparmor=secure-exec-userns ...
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile secure-exec-userns flags=(attach_disconnected,mediate_deleted) {
+  # Permit user-namespace creation (the whole point of this profile).
+  userns,
+
+  # Otherwise behave like an unconfined container: allow everything else.
+  # We are NOT using AppArmor as the confinement layer here — nsjail's
+  # namespaces + dropped caps + seccomp are. This profile exists solely to
+  # satisfy the unprivileged-userns kernel gate.
+  capability,
+  network,
+  mount,
+  umount,
+  pivot_root,
+  ptrace,
+  signal,
+  dbus,
+  unix,
+  file,
+
+  # Allow the profile to apply to nested/child processes without transition.
+  change_profile,
+}

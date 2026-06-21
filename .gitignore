@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# uv-managed virtualenv (recreated by `uv sync`)
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude Code local project state
+.claude/
+
+# OS
+.DS_Store

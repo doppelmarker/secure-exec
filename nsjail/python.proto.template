@@ -1,0 +1,227 @@
+# nsjail configuration for secure Python execution.
+#
+# Design goal: as strict as possible while still able to run numpy / pandas.
+# Inspired by Windmill's run.python3.config.proto, but hardened:
+#   - new user, pid, net, ipc, uts, mount, cgroup namespaces
+#   - pivot_root into a fresh, mostly-read-only rootfs (nsjail does this for us)
+#   - all capabilities dropped, no_new_privs enforced
+#   - seccomp via nsjail policy (kill dangerous syscalls)
+#   - no network at all (no loopback)
+#   - read-only binds of only what CPython + numpy/pandas need
+#
+# Placeholders are substituted by sandbox/run.sh at runtime:
+#   {TIME_LIMIT}  {RLIMIT_AS_MB}  {JOB_DIR}
+
+name: "secure-python-exec"
+description: "Strict single-shot Python sandbox"
+
+mode: ONCE
+hostname: "sandbox"
+cwd: "/sandbox"
+log_level: WARNING
+
+# ---- Resource limits (defense against resource-exhaustion DoS) ----
+# Each rlimit needs its *_type set to VALUE, otherwise nsjail leaves the limit
+# at the inherited soft value (e.g. rlimit_nproc_type defaults to SOFT, which
+# silently left RLIMIT_NPROC unlimited and let a fork bomb run to the timeout).
+time_limit: {TIME_LIMIT}        # wall-clock seconds, hard kill (SIGKILL)
+rlimit_as: {RLIMIT_AS_MB}       # address space (MB); caps memory incl. mmap
+rlimit_as_type: VALUE
+rlimit_cpu: {TIME_LIMIT}        # CPU seconds
+rlimit_cpu_type: VALUE
+rlimit_fsize: 50                # max file the job may write (MB)
+rlimit_fsize_type: VALUE
+rlimit_nofile: 256              # max open FDs
+rlimit_nofile_type: VALUE
+rlimit_nproc: 64                # max processes/threads (fork bomb guard)
+rlimit_nproc_type: VALUE
+rlimit_core: 0                  # no core dumps
+rlimit_core_type: VALUE
+
+# ---- Namespaces: isolate everything the kernel lets us ----
+clone_newnet: true              # no network namespace sharing -> no network
+clone_newuser: true             # rootless: map outer uid into a fresh userns
+clone_newns: true               # mount namespace
+clone_newpid: true              # process namespace (job is PID 1 of its tree)
+clone_newipc: true              # SysV IPC / POSIX mq isolation
+clone_newuts: true              # hostname isolation
+clone_newcgroup: true           # cgroup namespace
+
+# Rootless mapping: the jailed process is uid 0 *inside* its own user
+# namespace, but that maps to our unprivileged container uid (10001) outside.
+# This is the standard rootless-container model (Liz Rice, "Container
+# Security"): namespaced "root" that is powerless on the host. nsjail also
+# needs inside-uid 0 to perform the mounts / pivot_root that build the jail.
+# outside_id "" => the real uid of the nsjail process (the container's
+# unprivileged 'sandbox' user), so we never map to host root.
+uidmap { inside_id: "0" outside_id: "" count: 1 }
+gidmap { inside_id: "0" outside_id: "" count: 1 }
+
+# ---- Privilege hardening ----
+# After the jail is built, ALL capabilities are dropped, so the inside-root
+# above retains no real power. NO_NEW_PRIVS is on by default in nsjail
+# (disable_no_new_privs=false), so setuid/fscaps binaries cannot raise privs.
+keep_caps: false                # drop ALL capabilities
+disable_no_new_privs: false     # keep prctl(NO_NEW_PRIVS, 1)
+keep_env: false                 # start from an empty environment
+skip_setsid: false
+
+# ---- Network: deny everything ----
+# A fresh net namespace with no veth/lo brought up = no connectivity at all.
+iface_no_lo: true
+
+# ---- /proc: read-only, mostly to satisfy libc / numpy thread probing ----
+mount_proc: false
+mount {
+    dst: "/proc"
+    fstype: "proc"
+    rw: false
+}
+
+# ---- Root filesystem: read-only binds of only what we need ----
+# CPython interpreter + stdlib + site-packages live under /usr (image layout).
+mount {
+    src: "/usr"
+    dst: "/usr"
+    is_bind: true
+    rw: false
+}
+mount {
+    src: "/bin"
+    dst: "/bin"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/lib"
+    dst: "/lib"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/lib64"
+    dst: "/lib64"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+# numpy/pandas pull in BLAS/OpenBLAS + libstdc++ etc.; on arm64 they may live here.
+mount {
+    src: "/lib/aarch64-linux-gnu"
+    dst: "/lib/aarch64-linux-gnu"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+mount {
+    src: "/usr/lib/aarch64-linux-gnu"
+    dst: "/usr/lib/aarch64-linux-gnu"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+
+# Minimal /etc: ONLY the dynamic linker cache so the loader can find the
+# shared libs above. We deliberately do NOT bind /etc/passwd, /etc/group,
+# /etc/nsswitch.conf, /etc/hosts or /etc/resolv.conf:
+#   - no usernames/host info leaks into the sandbox
+#   - there is no network, so name resolution is irrelevant
+#   - glibc falls back to numeric uids without /etc/passwd, which is fine
+mount {
+    src: "/etc/ld.so.cache"
+    dst: "/etc/ld.so.cache"
+    is_bind: true
+    rw: false
+    mandatory: false
+}
+
+# ---- The job: user code + runner, read-only ----
+mount {
+    src: "{JOB_DIR}"
+    dst: "/sandbox"
+    is_bind: true
+    rw: false
+}
+
+# ---- Writable scratch: private tmpfs, capped, nodev/nosuid implied ----
+mount {
+    dst: "/tmp"
+    fstype: "tmpfs"
+    rw: true
+    is_bind: false
+    options: "size=64M"
+}
+mount {
+    dst: "/dev/shm"
+    fstype: "tmpfs"
+    rw: true
+    is_bind: false
+    options: "size=64M"
+}
+
+# ---- Minimal /dev ----
+mount {
+    src: "/dev/null"
+    dst: "/dev/null"
+    is_bind: true
+    rw: true
+}
+mount {
+    src: "/dev/zero"
+    dst: "/dev/zero"
+    is_bind: true
+    rw: true
+}
+mount {
+    src: "/dev/urandom"
+    dst: "/dev/urandom"
+    is_bind: true
+    rw: false
+}
+mount {
+    src: "/dev/random"
+    dst: "/dev/random"
+    is_bind: true
+    rw: false
+}
+
+# ---- Environment: minimal, predictable ----
+envar: "HOME=/tmp"
+envar: "TMPDIR=/tmp"
+envar: "PATH=/usr/local/bin:/usr/bin:/bin"
+envar: "LANG=C.UTF-8"
+envar: "PYTHONDONTWRITEBYTECODE=1"
+envar: "PYTHONUNBUFFERED=1"
+# Keep numeric libs from spawning huge thread pools (also bounded by rlimit_nproc).
+envar: "OPENBLAS_NUM_THREADS=1"
+envar: "OMP_NUM_THREADS=1"
+envar: "MKL_NUM_THREADS=1"
+
+# ---- seccomp-bpf policy ----
+# An allow-list is too brittle for CPython+numpy across kernels; instead we
+# KILL the syscalls most useful for sandbox escape / privilege manipulation and
+# let nsjail's namespace + capability layers do the rest.
+#
+# The KILL list is split into an arch-independent core (identifiers kafel
+# defines on every architecture) plus {SECCOMP_ARCH_EXTRA}, which run.sh fills
+# in per `uname -m`. Some identifiers (e.g. umount/umount2/kexec_file_load) are
+# only defined by kafel on certain arches; putting an undefined name in the
+# policy makes nsjail refuse to start, so we only add each where it compiles.
+# Each arch thus gets the strictest list it can actually enforce.
+seccomp_string: "POLICY a { "
+seccomp_string: "  KILL {"
+seccomp_string: "    ptrace, process_vm_readv, process_vm_writev,"
+seccomp_string: "    mount, pivot_root, chroot, "
+seccomp_string: "    setns, unshare,"
+seccomp_string: "    init_module, finit_module, delete_module,"
+seccomp_string: "    kexec_load,"
+seccomp_string: "    bpf, perf_event_open,"
+seccomp_string: "    reboot, swapon, swapoff,"
+seccomp_string: "    add_key, request_key, keyctl,"
+seccomp_string: "    acct, quotactl, nfsservctl"
+seccomp_string: "{SECCOMP_ARCH_EXTRA}"
+seccomp_string: "  } "
+seccomp_string: "} "
+seccomp_string: "USE a DEFAULT ALLOW"
