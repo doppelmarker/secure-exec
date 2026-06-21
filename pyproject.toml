@@ -1,10 +1,15 @@
 [project]
 name = "secure-exec"
 version = "0.1.0"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = []
 
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "installer: heavyweight integration tests for the install phase (spin up the egress proxy + per-user volumes + the installer image). Deselect with -m 'not installer'.",
 ]

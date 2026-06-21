@@ -21,16 +21,64 @@ syscalls, and resource exhaustion — and we have **tests that prove it**.
 ## Layout
 
 ```
-Dockerfile                          multi-stage; builds nsjail, minimal runtime
-nsjail/python.proto.template        the nsjail policy (the heart of the sandbox)
-sandbox/run.sh                      entrypoint: stage job, render config, exec nsjail
+Dockerfile                          multi-stage; runner / installer / proxy targets
+nsjail/python.proto.template        runner (exec) policy — the heart of the sandbox
+nsjail/install.proto.template       installer policy — network on, /venv RW
+sandbox/run.sh                      runner entrypoint: stage job, render config, exec nsjail
 sandbox/runner.py                   in-jail PID-1 runner; reports JSON result on fd 3
+sandbox/install.sh                  installer entrypoint: stage driver, render, exec nsjail
+sandbox/installer.py                in-jail PID-1 that runs pip; JSON result on fd 3
+sandbox/seccomp-arch.sh             per-arch seccomp KILL-list helper (sourced by both)
+proxy/tinyproxy.conf, proxy/allowlist   egress proxy: allow pypi.org + files.pythonhosted.org
 apparmor/secure-exec-userns         scoped AppArmor profile granting `userns,`
 examples/numpy_pandas.py            sample legitimate workload
-tests/conftest.py                   pytest harness that runs snippets via the image
+tests/conftest.py                   pytest harness (runner + installer fixtures)
 tests/test_functionality.py        positive tests (numpy/pandas etc. still work)
 tests/test_security.py             boundary tests (each maps to an isolation layer)
-Makefile                            build / run / example / test shortcuts
+tests/test_installer.py             install-phase tests (marked `installer`)
+Makefile                            build / run / example / test / venv shortcuts
+```
+
+## Two-phase model: runner + installer
+
+Users keep a **personal venv** (their chosen PyPI packages) in a per-user volume
+and run code against it. Installing arbitrary packages is **arbitrary code
+execution and needs network**; running user code must stay **air-gapped**. These
+are two trust profiles, so they are two separate images, each with its own nsjail
+policy:
+
+| Phase | Image | Network | `/venv` | Limits | Entry |
+|-------|-------|---------|---------|--------|-------|
+| exec | `secure-exec-runner` | none | read-only | strict (10s/512MB) | `run.sh` |
+| install | `secure-exec-installer` | proxy only | read-write | relaxed (300s/2048MB) | `install.sh` |
+
+- **One venv, always.** The runner imports third-party packages only from a
+  single venv mounted at `/venv` (`PYTHONPATH=/venv/site`). `run.sh` binds the
+  user's volume when one is attached (a populated `/venv/site`), else the
+  **default venv** (numpy + pandas) baked into the runner image at
+  `/opt/default-venv`. A user venv **fully replaces** the default (not layered).
+- **`pip --target`, not `python -m venv`.** The volume holds packages only; the
+  executing interpreter is always the trusted image python, never a user-writable
+  binary.
+- **Egress is enforced at the network layer, not by env vars.** The installer
+  joins an `--internal` Docker network whose only peer is the proxy, so it has no
+  route to the internet — even raw sockets reach nothing but the proxy. The proxy
+  alone bridges out and allow-lists `pypi.org` + `files.pythonhosted.org` (L7).
+  `HTTP(S)_PROXY` is set for pip's *functionality*; the *security* is the
+  topology. Maps to K8s NetworkPolicy (installer→proxy; proxy→PyPI; runner
+  default-deny).
+- **Wheel vs source.** Default `SE_INSTALL_MODE=wheel` (`pip --only-binary :all:`)
+  ships no compiler and runs no `setup.py` at install time — all package code is
+  deferred to import, i.e. to the locked-down runner. `source` mode
+  (`installer-source` image) adds gcc/headers to build sdists; that build code
+  runs inside the install jail. Wheel is the default; source is opt-in.
+
+Usage:
+```sh
+make proxy-up                                   # start the egress proxy
+make venv-create  USER=alice
+make install-venv USER=alice PKGS="rich httpx"  # pip under nsjail, via proxy
+echo 'import rich; print(rich.__version__)' | make exec-venv USER=alice
 ```
 
 ## Security model (defense in depth)
@@ -46,6 +94,16 @@ Layers enforced by `nsjail/python.proto.template`:
 | `/proc` leak | fresh namespaced RO procfs; no caps + kernel hardening neuter sensitive files | `test_sensitive_proc_files_leak_nothing` |
 | Syscalls | seccomp-bpf KILL list (ptrace, mount, unshare, bpf, …) | `test_ptrace_killed`, `test_unshare_killed` |
 | Resources | `rlimit_as/cpu/nproc/fsize/nofile` (all `*_type:VALUE`), `time_limit` | `test_memory_limit`, `test_cpu_time_limit`, `test_fork_bomb_contained` |
+
+Install-phase layers (`nsjail/install.proto.template` + the proxy topology):
+
+| Layer | Mechanism | Proven by |
+|-------|-----------|-----------|
+| Egress (L3) | `--internal` net: installer's only route is the proxy | `test_install_from_non_pypi_index_is_blocked` |
+| Egress (L7) | tinyproxy `FilterDefaultDeny` allow-lists pypi.org + files.pythonhosted.org | `test_install_from_non_pypi_index_is_blocked` |
+| venv RO at exec | runner binds `/venv` read-only | `test_venv_readonly_in_exec` |
+| no compiler (wheel) | `--only-binary :all:`; image has no gcc | `test_wheel_image_has_no_compiler`, `test_wheel_mode_rejects_sdist_only` |
+| install jailed | same caps/seccomp/pivot_root as runner | (install runs under nsjail) |
 
 We use **modern primitives**: pivot_root (not chroot), user namespaces for
 rootless isolation, seccomp-bpf, and PID/IPC/UTS/cgroup namespaces.
@@ -164,8 +222,20 @@ image itself needs no privilege.
 
 ## Tuning knobs (env vars on the container)
 
+Runner (exec):
 - `SE_TIME_LIMIT` — wall-clock & CPU seconds (default 10)
 - `SE_MEM_MB` — address-space cap in MB (default 512)
+
+Installer:
+- `SE_INSTALL_TIME_LIMIT` — wall/CPU seconds (default 300)
+- `SE_INSTALL_MEM_MB` — address-space cap in MB (default 2048)
+- `SE_INSTALL_MODE` — `wheel` (default) | `source`
+- `SE_PROXY_URL` — egress proxy URL (functional only; topology enforces egress)
+- `SE_INDEX_URL` — override pip's index (test hook; a non-PyPI value is blocked
+  by the proxy)
+- `SE_PIP_TIMEOUT` — pip per-attempt socket timeout, seconds (default 15)
+- `SE_PIP_RETRIES` — pip retry count (default 2); bounds how long a blocked or
+  flaky index hangs before failing
 
 ## Gotchas
 
@@ -196,4 +266,20 @@ image itself needs no privilege.
 - The `/lib64` mount warning on arm64 is harmless (`mandatory:false`; arm64 has
   no `/lib64`). It's kept for x86_64 portability.
 - nsjail version is pinned via `NSJAIL_VERSION` build arg.
+- **The `--internal` proxy network is the load-bearing egress control.** If
+  `se-proxy-net` is created WITHOUT `--internal`, Docker's default NAT gives the
+  installer direct internet access and the egress guarantee collapses. `make
+  proxy-up` always creates it `--internal`.
+- **`HTTP(S)_PROXY` is NOT a security boundary** — it's advisory and only makes a
+  cooperating pip succeed. Malicious install code that ignores it just finds no
+  route (the topology blocks it). Don't "rely on" the env var for isolation.
+- **The 1GB per-user venv cap is not enforced locally.** A persistent, *shared*
+  volume is needed (installer writes, runner reads), and the stock `local` driver
+  has no on-disk quota; a tmpfs volume that DOES cap size is per-container and
+  isn't shared. So `make venv-create` uses a plain named volume; the cap is a
+  deployment concern (in K8s, the PVC size).
+- **New volume is root-owned → install EACCES on `/venv/site`.** Docker copies
+  the image's mount-point ownership onto a fresh empty volume, so the installer
+  image pre-creates `/venv` owned by uid 10001; otherwise pip (namespaced root →
+  host 10001) can't write.
 ```

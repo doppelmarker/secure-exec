@@ -15,7 +15,6 @@ SE_INSTALL_MODE ?= wheel
 USER ?=                                 # per-user id, e.g. USER=alice
 PKGS ?=                                 # space-separated packages, e.g. PKGS="numpy pandas"
 VENV_VOLUME      ?= se-venv-$(USER)     # per-user Docker volume name
-VENV_SIZE_BYTES  ?= 1073741824          # 1 GiB cap for a user venv
 PROXY_NET        ?= se-proxy-net        # --internal net: installer <-> proxy ONLY
 EGRESS_NET       ?= se-egress-net       # proxy's route to the internet
 PROXY_NAME       ?= se-proxy            # running proxy container name
@@ -128,16 +127,14 @@ proxy-up:
 proxy-down:
 	-docker rm -f $(PROXY_NAME)
 
-# Create a per-user venv volume with a ~1GiB cap. NOTE: a hard ON-DISK quota is
-# not enforceable with the stock local driver; this size-capped tmpfs volume is a
-# RAM-backed approximation (in K8s the PVC size is the real quota). Override with
-# VENV_VOLUME / VENV_SIZE_BYTES.
+# Create a per-user venv volume. A plain named volume so it PERSISTS and is
+# shared between the installer (writes) and runner (reads). The 1GiB cap is not
+# enforced locally (the stock local driver has no on-disk quota, and a tmpfs
+# volume that does cap size isn't shared across containers); the cap is a
+# deployment concern -- in K8s it's the PVC size. Override name via VENV_VOLUME.
 venv-create:
 	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }
-	docker volume create --driver local \
-		--opt type=tmpfs --opt device=tmpfs \
-		--opt o=size=$(VENV_SIZE_BYTES) \
-		$(VENV_VOLUME)
+	docker volume create $(VENV_VOLUME)
 
 venv-remove:
 	@test -n "$(USER)" || { echo "USER= is required"; exit 1; }

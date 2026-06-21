@@ -174,7 +174,7 @@ def test_cpu_time_limit(run_in_sandbox):
     r = run_in_sandbox("""
         while True:
             pass
-    """, time_limit=3, timeout=30)
+    """, time_limit=2, timeout=30)
     assert not r.ok, r
 
 

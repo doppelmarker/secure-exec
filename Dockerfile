@@ -138,6 +138,12 @@ RUN chmod 0755 /opt/secure-exec/sandbox/install.sh \
     && chmod 0444 /opt/secure-exec/sandbox/installer.py \
                   /opt/secure-exec/nsjail/install.proto.template
 
+# Pre-create /venv owned by the unprivileged user. Docker copies this ownership
+# onto a freshly-created empty volume mounted here, so pip (running as namespaced
+# root -> host uid 10001) can write the venv. Without this the new volume is
+# root-owned and the install fails with EACCES on /venv/site.
+RUN mkdir -p /venv && chown 10001:10001 /venv
+
 USER 10001
 WORKDIR /home/sandbox
 ENTRYPOINT ["/opt/secure-exec/sandbox/install.sh"]

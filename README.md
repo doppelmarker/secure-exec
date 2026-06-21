@@ -10,12 +10,27 @@ See [CLAUDE.md](./CLAUDE.md) for the full security model and contributor notes.
 ## Quick start
 
 ```sh
-make build
+make build                   # builds runner + installer + proxy images
 make apparmor                # one-time: load the scoped userns AppArmor profile
-make example                 # numpy + pandas workload
+make example                 # numpy + pandas workload (default venv)
 echo 'print(2**10)' | make run
-make test                    # runs the security + functionality test suite
+make test                    # security + functionality + installer suite
 ```
+
+### Per-user venvs
+
+Users keep a personal venv of PyPI packages and run code against it. Installs run
+under nsjail with egress restricted to PyPI via a proxy; exec stays air-gapped.
+
+```sh
+make proxy-up                                   # start the egress proxy
+make venv-create  USER=alice
+make install-venv USER=alice PKGS="rich httpx"  # pip under nsjail, via proxy
+echo 'import rich; print(rich.__version__)' | make exec-venv USER=alice
+```
+
+See [CLAUDE.md](./CLAUDE.md) → "Two-phase model" for the runner/installer split,
+the egress topology, and wheel-vs-source mode.
 
 `make apparmor` loads `apparmor/secure-exec-userns` into the host kernel. It is
 needed on hosts that set `kernel.apparmor_restrict_unprivileged_userns=1`

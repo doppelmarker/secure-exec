@@ -59,4 +59,5 @@ exec nsjail \
     --env "SE_PACKAGES=${PACKAGES}" \
     --env "SE_INSTALL_MODE=${INSTALL_MODE}" \
     --env "SE_PROXY_URL=${PROXY_URL}" \
+    --env "SE_INDEX_URL=${SE_INDEX_URL:-}" \
     -- /usr/local/bin/python3 -B /sandbox/installer.py

@@ -38,6 +38,9 @@ def main() -> int:
     packages = (os.environ.get("SE_PACKAGES") or "").split()
     mode = (os.environ.get("SE_INSTALL_MODE") or "wheel").strip().lower()
     proxy = os.environ.get("SE_PROXY_URL") or ""
+    index_url = os.environ.get("SE_INDEX_URL") or ""
+    net_timeout = os.environ.get("SE_PIP_TIMEOUT") or "15"
+    retries = os.environ.get("SE_PIP_RETRIES") or "2"
 
     if not packages:
         _emit({"ok": False, "error": "no packages given (SE_PACKAGES empty)"})
@@ -54,12 +57,15 @@ def main() -> int:
         "--no-input",
         "--disable-pip-version-check",
         "--no-cache-dir",
+        "--timeout", net_timeout,   # per-attempt socket timeout (pip default 15)
+        "--retries", retries,       # bound retries so a blocked index fails fast
     ]
     if proxy:
         cmd += ["--proxy", proxy]
+    if index_url:
+        cmd += ["--index-url", index_url]
     if mode == "wheel":
-        # Wheels only: no setup.py runs at install time; no compiler needed.
-        cmd += ["--only-binary", ":all:"]
+        cmd += ["--only-binary", ":all:"]   # no setup.py at install time, no compiler
     cmd += packages
 
     proc = subprocess.run(cmd, capture_output=True, text=True)
