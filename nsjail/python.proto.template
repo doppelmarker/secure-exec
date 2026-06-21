@@ -145,6 +145,23 @@ mount {
     rw: false
 }
 
+# ---- The venv: EXACTLY ONE, read-only, on PYTHONPATH ----
+# The runner never imports from the image's own site-packages; all third-party
+# packages come from a single venv mounted here. run.sh selects the SOURCE
+# ({VENV_SRC}) outside the jail:
+#   - the user's volume (a populated /venv/site) when one is attached, else
+#   - the baked default venv (/opt/default-venv, numpy + pandas).
+# Either way the jail sees one /venv with /venv/site on PYTHONPATH (set below).
+# It is read-only so untrusted code can import but never modify packages, and
+# the interpreter is always the trusted image python (we use pip --target, not
+# `python -m venv`, so no user-writable interpreter is ever mounted).
+mount {
+    src: "{VENV_SRC}"
+    dst: "/venv"
+    is_bind: true
+    rw: false
+}
+
 # ---- Writable scratch: private tmpfs, capped, nodev/nosuid implied ----
 mount {
     dst: "/tmp"
@@ -194,6 +211,10 @@ envar: "PATH=/usr/local/bin:/usr/bin:/bin"
 envar: "LANG=C.UTF-8"
 envar: "PYTHONDONTWRITEBYTECODE=1"
 envar: "PYTHONUNBUFFERED=1"
+# All third-party packages come from the single mounted venv. Only /venv/site
+# (pip --target dir) is on the path; volume-level metadata under /venv stays off
+# PYTHONPATH and out of reach of imports.
+envar: "PYTHONPATH=/venv/site"
 # Keep numeric libs from spawning huge thread pools (also bounded by rlimit_nproc).
 envar: "OPENBLAS_NUM_THREADS=1"
 envar: "OMP_NUM_THREADS=1"

@@ -76,10 +76,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get purge -y --auto-remove
 
-# Pinned scientific stack the sandbox is allowed to run.
-RUN pip install --no-cache-dir \
+# Default venv (RUNNER ONLY). The runner imports third-party packages ONLY from
+# a venv mounted at /venv (PYTHONPATH=/venv/site), never from the image's own
+# site-packages. When no user volume is attached, run.sh binds this baked default
+# venv as /venv. Built with pip --target (NOT `python -m venv`) so it holds
+# packages only, no interpreter; made read-only so nothing can mutate it at
+# runtime. The installer image does NOT get this (it builds user venvs instead);
+# when the Dockerfile is split (runtime-base -> runner/installer), this step
+# moves into the runner target only.
+RUN pip install --no-cache-dir --target=/opt/default-venv/site \
         numpy==2.2.1 \
-        pandas==2.2.3
+        pandas==2.2.3 \
+    && chmod -R a-w /opt/default-venv
 
 COPY --from=build /src/nsjail /usr/local/bin/nsjail
 
